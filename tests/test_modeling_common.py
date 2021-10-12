@@ -16,6 +16,8 @@
 import copy
 import gc
 import inspect
+import json
+import os
 import os.path
 import random
 import tempfile
@@ -23,9 +25,9 @@ import unittest
 import warnings
 from typing import Dict, List, Tuple
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, Repository
 from requests.exceptions import HTTPError
-from transformers import is_torch_available, logging
+from transformers import AutoModel, AutoModelForSequenceClassification, is_torch_available, logging
 from transformers.file_utils import WEIGHTS_NAME, is_torch_fx_available
 from transformers.models.auto import get_values
 from transformers.testing_utils import (
@@ -33,6 +35,7 @@ from transformers.testing_utils import (
     PASS,
     USER,
     CaptureLogger,
+    TestCasePlus,
     is_staging_test,
     require_torch,
     require_torch_multi_gpu,
@@ -65,6 +68,7 @@ if is_torch_available():
         ModelWithHeadsAdaptersMixin,
         PretrainedConfig,
         PreTrainedModel,
+        T5Config,
         T5ForConditionalGeneration,
     )
 
@@ -93,6 +97,7 @@ class ModelTesterMixin:
     test_torchscript = True
     test_pruning = True
     test_resize_embeddings = True
+    test_resize_position_embeddings = False
     test_head_masking = True
     test_missing_keys = True
     test_model_parallel = False
@@ -164,7 +169,7 @@ class ModelTesterMixin:
                 max_diff = np.amax(np.abs(out_1 - out_2))
                 self.assertLessEqual(max_diff, 1e-5)
 
-    def test_save_load__keys_to_ignore_on_save(self):
+    def test_save_load_keys_to_ignore_on_save(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
 
         for model_class in self.all_model_classes:
@@ -175,7 +180,7 @@ class ModelTesterMixin:
 
             # check the keys are in the original state_dict
             for k in _keys_to_ignore_on_save:
-                self.assertIn(k, model.state_dict())
+                self.assertIn(k, model.state_dict().keys(), "\n".join(model.state_dict().keys()))
 
             # check that certain keys didn't get saved with the model
             with tempfile.TemporaryDirectory() as tmpdirname:
@@ -183,7 +188,7 @@ class ModelTesterMixin:
                 output_model_file = os.path.join(tmpdirname, WEIGHTS_NAME)
                 state_dict_saved = torch.load(output_model_file)
                 for k in _keys_to_ignore_on_save:
-                    self.assertNotIn(k, state_dict_saved)
+                    self.assertNotIn(k, state_dict_saved.keys(), "\n".join(state_dict_saved.keys()))
 
                 # Test we can load the state dict in the model, necessary for the checkpointing API in Trainer.
                 load_result = model.load_state_dict(state_dict_saved, strict=False)
@@ -367,15 +372,18 @@ class ModelTesterMixin:
 
     def test_training_gradient_checkpointing(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-        if not self.model_tester.is_training or not hasattr(config, "gradient_checkpointing"):
+        if not self.model_tester.is_training:
             return
 
-        config.gradient_checkpointing = True
         config.use_cache = False
         config.return_dict = True
 
         for model_class in self.all_model_classes:
-            if model_class in get_values(MODEL_MAPPING) or model_class in get_values(MODEL_WITH_HEADS_MAPPING):
+            if (
+                model_class in get_values(MODEL_MAPPING)
+                or model_class in get_values(MODEL_WITH_HEADS_MAPPING)
+                or not model_class.supports_gradient_checkpointing
+            ):
                 continue
             model = model_class(config)
             model.to(torch_device)
@@ -1066,6 +1074,85 @@ class ModelTesterMixin:
             hidden_states_with_chunk = model(**self._prepare_for_class(inputs_dict, model_class))[0]
             self.assertTrue(torch.allclose(hidden_states_no_chunk, hidden_states_with_chunk, atol=1e-3))
 
+    def test_resize_position_vector_embeddings(self):
+        if not self.test_resize_position_embeddings:
+            return
+
+        (
+            original_config,
+            inputs_dict,
+        ) = self.model_tester.prepare_config_and_inputs_for_common()
+
+        for model_class in self.all_model_classes:
+            config = copy.deepcopy(original_config)
+            model = model_class(config)
+            model.to(torch_device)
+
+            if self.model_tester.is_training is False:
+                model.eval()
+
+            max_position_embeddings = config.max_position_embeddings
+
+            # Retrieve the embeddings and clone theme
+            if model.config.is_encoder_decoder:
+                encoder_model_embed, decoder_model_embed = model.get_position_embeddings()
+                encoder_cloned_embeddings = encoder_model_embed.weight.clone()
+                decoder_cloned_embeddings = decoder_model_embed.weight.clone()
+            else:
+                model_embed = model.get_position_embeddings()
+                cloned_embeddings = model_embed.weight.clone()
+
+            # Check that resizing the position embeddings with a larger max_position_embeddings increases
+            # the model's postion embeddings size
+            model.resize_position_embeddings(max_position_embeddings + 10)
+            self.assertEqual(model.config.max_position_embeddings, max_position_embeddings + 10)
+
+            # Check that it actually resizes the embeddings matrix
+            if model.config.is_encoder_decoder:
+                encoder_model_embed, decoder_model_embed = model.get_position_embeddings()
+                self.assertEqual(encoder_model_embed.weight.shape[0], encoder_cloned_embeddings.shape[0] + 10)
+                self.assertEqual(decoder_model_embed.weight.shape[0], decoder_cloned_embeddings.shape[0] + 10)
+            else:
+                model_embed = model.get_position_embeddings()
+                self.assertEqual(model_embed.weight.shape[0], cloned_embeddings.shape[0] + 10)
+
+            # Check that the model can still do a forward pass successfully (every parameter should be resized)
+            model(**self._prepare_for_class(inputs_dict, model_class))
+
+            # Check that resizing the position embeddings with a smaller max_position_embeddings decreases
+            # the model's max_position_embeddings
+            model.resize_position_embeddings(max_position_embeddings - 5)
+            self.assertEqual(model.config.max_position_embeddings, max_position_embeddings - 5)
+
+            # Check that it actually resizes the embeddings matrix
+            if model.config.is_encoder_decoder:
+                encoder_model_embed, decoder_model_embed = model.get_position_embeddings()
+                self.assertEqual(encoder_model_embed.weight.shape[0], encoder_cloned_embeddings.shape[0] - 5)
+                self.assertEqual(decoder_model_embed.weight.shape[0], decoder_cloned_embeddings.shape[0] - 5)
+            else:
+                model_embed = model.get_position_embeddings()
+                self.assertEqual(model_embed.weight.shape[0], cloned_embeddings.shape[0] - 5)
+
+            # Check that the model can still do a forward pass successfully (every parameter should be resized)
+            model(**self._prepare_for_class(inputs_dict, model_class))
+
+            # Check that adding and removing tokens has not modified the first part of the embedding matrix.
+            models_equal = True
+
+            if model.config.is_encoder_decoder:
+                for p1, p2 in zip(encoder_cloned_embeddings, encoder_model_embed.weight):
+                    if p1.data.ne(p2.data).sum() > 0:
+                        models_equal = False
+                for p1, p2 in zip(decoder_cloned_embeddings, decoder_model_embed.weight):
+                    if p1.data.ne(p2.data).sum() > 0:
+                        models_equal = False
+            else:
+                for p1, p2 in zip(cloned_embeddings, model_embed.weight):
+                    if p1.data.ne(p2.data).sum() > 0:
+                        models_equal = False
+
+            self.assertTrue(models_equal)
+
     def test_resize_tokens_embeddings(self):
         (
             original_config,
@@ -1532,6 +1619,35 @@ class ModelTesterMixin:
 
                     loss.backward()
 
+    def test_load_with_mismatched_shapes(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+
+        for model_class in self.all_model_classes:
+            if model_class not in get_values(MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING):
+                continue
+
+            with self.subTest(msg=f"Testing {model_class}"):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    model = model_class(config)
+                    model.save_pretrained(tmp_dir)
+
+                    # Fails when we don't set ignore_mismatched_sizes=True
+                    with self.assertRaises(RuntimeError) as e:
+                        print(type(e))
+                        new_model = AutoModelForSequenceClassification.from_pretrained(tmp_dir, num_labels=42)
+
+                    logger = logging.get_logger("transformers.modeling_utils")
+                    with CaptureLogger(logger) as cl:
+                        new_model = AutoModelForSequenceClassification.from_pretrained(
+                            tmp_dir, num_labels=42, ignore_mismatched_sizes=True
+                        )
+                    self.assertIn("the shapes did not match", cl.out)
+
+                    new_model.to(torch_device)
+                    inputs = self._prepare_for_class(inputs_dict, model_class)
+                    logits = new_model(**inputs).logits
+                    self.assertEqual(logits.shape[1], 42)
+
 
 global_rng = random.Random()
 
@@ -1576,7 +1692,7 @@ def floats_tensor(shape, scale=1.0, rng=None, name=None):
 
 
 @require_torch
-class ModelUtilsTest(unittest.TestCase):
+class ModelUtilsTest(TestCasePlus):
     @slow
     def test_model_from_pretrained(self):
         for model_name in BERT_PRETRAINED_MODEL_ARCHIVE_LIST[:1]:
@@ -1588,8 +1704,11 @@ class ModelUtilsTest(unittest.TestCase):
             model, loading_info = BertModel.from_pretrained(model_name, output_loading_info=True)
             self.assertIsNotNone(model)
             self.assertIsInstance(model, PreTrainedModel)
-            for value in loading_info.values():
-                self.assertEqual(len(value), 0)
+
+            self.assertEqual(len(loading_info["missing_keys"]), 0)
+            self.assertEqual(len(loading_info["unexpected_keys"]), 8)
+            self.assertEqual(len(loading_info["mismatched_keys"]), 0)
+            self.assertEqual(len(loading_info["error_msgs"]), 0)
 
             config = BertConfig.from_pretrained(model_name, output_attentions=True, output_hidden_states=True)
 
@@ -1609,6 +1728,113 @@ class ModelUtilsTest(unittest.TestCase):
             BertModel.from_pretrained(TINY_T5)
         self.assertTrue("You are using a model of type t5 to instantiate a model of type bert" in cl.out)
 
+    @require_torch
+    def test_model_from_config_torch_dtype(self):
+        # test that the model can be instantiated with dtype of user's choice - as long as it's a
+        # float dtype. To make it happen config.torch_dtype needs to be set before instantiating the
+        # model from the config object.
+
+        config = T5Config.from_pretrained(TINY_T5)
+        model = AutoModel.from_config(config)
+        # XXX: isn't supported
+        # model = T5ForConditionalGeneration.from_config(config)
+        self.assertEqual(model.dtype, torch.float32)
+
+        model = AutoModel.from_config(config, torch_dtype=torch.float16)
+        self.assertEqual(model.dtype, torch.float16)
+
+        # torch.set_default_dtype() supports only float dtypes, so will fail with non-float type
+        with self.assertRaises(ValueError):
+            model = AutoModel.from_config(config, torch_dtype=torch.int64)
+
+    @require_torch
+    def test_model_from_pretrained_torch_dtype(self):
+        # test that the model can be instantiated with dtype of either
+        # 1. explicit from_pretrained's torch_dtype argument
+        # 2. via autodiscovery by looking at model weights (torch_dtype="auto")
+        # so if a model.half() was saved, we want it to be instantiated as such.
+        #
+        # test an explicit model class, but also AutoModel separately as the latter goes through a different code path
+        model_path = self.get_auto_remove_tmp_dir()
+
+        # baseline - we know TINY_T5 is fp32 model
+        model = T5ForConditionalGeneration.from_pretrained(TINY_T5)
+        self.assertEqual(model.dtype, torch.float32)
+
+        # test the default fp32 save_pretrained => from_pretrained cycle
+        model.save_pretrained(model_path)
+        model = T5ForConditionalGeneration.from_pretrained(model_path)
+        self.assertEqual(model.dtype, torch.float32)
+        # test with auto-detection
+        model = T5ForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto")
+        self.assertEqual(model.dtype, torch.float32)
+
+        # test forced loading in fp16 (even though the weights are in fp32)
+        model = T5ForConditionalGeneration.from_pretrained(model_path, torch_dtype=torch.float16)
+        self.assertEqual(model.dtype, torch.float16)
+
+        # test fp16 save_pretrained, loaded with auto-detection
+        model = model.half()
+        model.save_pretrained(model_path)
+        model = T5ForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto")
+        self.assertEqual(model.config.torch_dtype, torch.float16)
+        self.assertEqual(model.dtype, torch.float16)
+
+        # tests `config.torch_dtype` saving
+        with open(f"{model_path}/config.json") as f:
+            config_dict = json.load(f)
+        self.assertEqual(config_dict["torch_dtype"], "float16")
+
+        # test fp16 save_pretrained, loaded with the explicit fp16
+        model = T5ForConditionalGeneration.from_pretrained(model_path, torch_dtype=torch.float16)
+        self.assertEqual(model.dtype, torch.float16)
+
+        # test AutoModel separately as it goes through a different path
+        # test auto-detection
+        model = AutoModel.from_pretrained(TINY_T5, torch_dtype="auto")
+        self.assertEqual(model.dtype, torch.float32)
+        # test forcing an explicit dtype
+        model = AutoModel.from_pretrained(TINY_T5, torch_dtype=torch.float16)
+        self.assertEqual(model.dtype, torch.float16)
+
+
+if is_torch_available():
+
+    class FakeModel(PreTrainedModel):
+        config_class = BertConfig
+        base_model_prefix = "fake"
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.linear = torch.nn.Linear(config.hidden_size, config.hidden_size)
+
+        def forward(self, x):
+            return self.linear(x)
+
+        def _init_weights(self, module):
+            pass
+
+
+# Make sure this is synchronized with the model above.
+FAKE_MODEL_CODE = """
+import torch
+from transformers import BertConfig, PreTrainedModel
+
+class FakeModel(PreTrainedModel):
+    config_class = BertConfig
+    base_model_prefix = "fake"
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.linear = torch.nn.Linear(config.hidden_size, config.hidden_size)
+
+    def forward(self, x):
+        return self.linear(x)
+
+    def _init_weights(self, module):
+        pass
+"""
+
 
 @require_torch
 @is_staging_test
@@ -1627,6 +1853,11 @@ class ModelPushToHubTester(unittest.TestCase):
 
         try:
             cls._api.delete_repo(token=cls._token, name="test-model-org", organization="valid_org")
+        except HTTPError:
+            pass
+
+        try:
+            cls._api.delete_repo(token=cls._token, name="test-dynamic-model")
         except HTTPError:
             pass
 
@@ -1658,3 +1889,23 @@ class ModelPushToHubTester(unittest.TestCase):
             new_model = BertModel.from_pretrained("valid_org/test-model-org")
             for p1, p2 in zip(model.parameters(), new_model.parameters()):
                 self.assertTrue(torch.equal(p1, p2))
+
+    def test_push_to_hub_dynamic_model(self):
+        config = BertConfig(
+            vocab_size=99, hidden_size=32, num_hidden_layers=5, num_attention_heads=4, intermediate_size=37
+        )
+        config.auto_map = {"AutoModel": "modeling.FakeModel"}
+        model = FakeModel(config)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            repo = Repository(tmp_dir, clone_from=f"{USER}/test-dynamic-model", use_auth_token=self._token)
+            model.save_pretrained(tmp_dir)
+            with open(os.path.join(tmp_dir, "modeling.py"), "w") as f:
+                f.write(FAKE_MODEL_CODE)
+
+            repo.push_to_hub()
+            print(os.listdir(tmp_dir))
+
+        new_model = AutoModel.from_pretrained(f"{USER}/test-dynamic-model", trust_remote_code=True)
+        for p1, p2 in zip(model.parameters(), new_model.parameters()):
+            self.assertTrue(torch.equal(p1, p2))

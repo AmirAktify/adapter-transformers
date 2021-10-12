@@ -14,9 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ OpenAI GPT-2 configuration """
+from collections import OrderedDict
+from typing import Any, Mapping, Optional
+
+from transformers import PreTrainedTokenizer, TensorType, is_torch_available
 
 from ...adapters.model_mixin import ModelConfigAdaptersMixin
 from ...configuration_utils import PretrainedConfig
+from ...onnx import OnnxConfigWithPast
 from ...utils import logging
 
 
@@ -104,9 +109,7 @@ class GPT2Config(ModelConfigAdaptersMixin, PretrainedConfig):
 
             The dropout ratio to be used after the projection and activation.
         scale_attn_weights (:obj:`bool`, `optional`, defaults to :obj:`True`):
-            Scale attention weights by dividing by sqrt(hidden_size).
-        gradient_checkpointing (:obj:`bool`, `optional`, defaults to :obj:`False`):
-            Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.
+            Scale attention weights by dividing by sqrt(hidden_size)..
         use_cache (:obj:`bool`, `optional`, defaults to :obj:`True`):
             Whether or not the model should return the last key/values attentions (not used by all models).
 
@@ -126,6 +129,12 @@ class GPT2Config(ModelConfigAdaptersMixin, PretrainedConfig):
 
     model_type = "gpt2"
     keys_to_ignore_at_inference = ["past_key_values"]
+    attribute_map = {
+        "hidden_size": "n_embd",
+        "max_position_embeddings": "n_positions",
+        "num_attention_heads": "n_head",
+        "num_hidden_layers": "n_layer",
+    }
 
     def __init__(
         self,
@@ -148,14 +157,11 @@ class GPT2Config(ModelConfigAdaptersMixin, PretrainedConfig):
         summary_proj_to_labels=True,
         summary_first_dropout=0.1,
         scale_attn_weights=True,
-        gradient_checkpointing=False,
         use_cache=True,
         bos_token_id=50256,
         eos_token_id=50256,
         **kwargs
     ):
-        super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
-
         self.vocab_size = vocab_size
         self.n_ctx = n_ctx
         self.n_positions = n_positions
@@ -174,28 +180,13 @@ class GPT2Config(ModelConfigAdaptersMixin, PretrainedConfig):
         self.summary_activation = summary_activation
         self.summary_first_dropout = summary_first_dropout
         self.summary_proj_to_labels = summary_proj_to_labels
-        self.gradient_checkpointing = gradient_checkpointing
         self.scale_attn_weights = scale_attn_weights
         self.use_cache = use_cache
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
-    @property
-    def max_position_embeddings(self):
-        return self.n_positions
-
-    @property
-    def hidden_size(self):
-        return self.n_embd
-
-    @property
-    def num_attention_heads(self):
-        return self.n_head
-
-    @property
-    def num_hidden_layers(self):
-        return self.n_layer
+        super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
     @property
     def hidden_dropout_prob(self):
@@ -204,3 +195,61 @@ class GPT2Config(ModelConfigAdaptersMixin, PretrainedConfig):
     @property
     def attention_probs_dropout_prob(self):
         return self.attn_pdrop
+
+
+class GPT2OnnxConfig(OnnxConfigWithPast):
+    @property
+    def inputs(self) -> Mapping[str, Mapping[int, str]]:
+        common_inputs = OrderedDict({"input_ids": {0: "batch"}})
+        if self.use_past:
+            for i in range(self._config.n_layer * 2):
+                common_inputs[f"past_key_values.{i}"] = {0: "batch", 2: "sequence"}
+
+            common_inputs["attention_mask"] = {0: "batch", 1: "sequence"}
+        else:
+            common_inputs["attention_mask"] = {0: "batch", 1: "sequence"}
+
+        return common_inputs
+
+    @property
+    def outputs(self) -> Mapping[str, Mapping[int, str]]:
+        common_outputs = OrderedDict({"last_hidden_state": {0: "batch", 1: "sequence"}})
+        if self.use_past:
+            for i in range(self._config.n_layer * 2):
+                common_outputs[f"present.{i}"] = {0: "batch", 2: "sequence"}
+
+            return common_outputs
+
+        return common_outputs
+
+    def generate_dummy_inputs(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        batch_size: int = -1,
+        seq_length: int = -1,
+        is_pair: bool = False,
+        framework: Optional[TensorType] = None,
+    ) -> Mapping[str, Any]:
+        common_inputs = super().generate_dummy_inputs(tokenizer, batch_size, seq_length, is_pair, framework)
+
+        # We need to order the input in the way they appears in the forward()
+        ordered_inputs = OrderedDict({"input_ids": common_inputs["input_ids"]})
+
+        # Need to add the past_keys
+        if self.use_past:
+            if not is_torch_available():
+                raise ValueError("Cannot generate dummy past_keys inputs without PyTorch installed.")
+            else:
+                import torch
+
+                batch = common_inputs["input_ids"].shape[0]
+                ordered_inputs["past_key_values"] = [
+                    (
+                        torch.zeros((batch, self._config.n_head, 1, self._config.hidden_size // self._config.n_head)),
+                        torch.zeros((batch, self._config.n_head, 1, self._config.hidden_size // self._config.n_head)),
+                    )
+                    for _ in range(self._config.n_layer)
+                ]
+
+        ordered_inputs["attention_mask"] = common_inputs["attention_mask"]
+        return ordered_inputs

@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ DistilBERT model configuration """
-
+from collections import OrderedDict
+from typing import Mapping
 
 from ...adapters.model_mixin import ModelConfigAdaptersMixin
 from ...configuration_utils import PretrainedConfig
+from ...onnx import OnnxConfig
 from ...utils import logging
 
 
@@ -92,6 +94,11 @@ class DistilBertConfig(ModelConfigAdaptersMixin, PretrainedConfig):
         >>> configuration = model.config
     """
     model_type = "distilbert"
+    attribute_map = {
+        "hidden_size": "dim",
+        "num_attention_heads": "n_heads",
+        "num_hidden_layers": "n_layers",
+    }
 
     def __init__(
         self,
@@ -111,7 +118,6 @@ class DistilBertConfig(ModelConfigAdaptersMixin, PretrainedConfig):
         pad_token_id=0,
         **kwargs
     ):
-        super().__init__(**kwargs, pad_token_id=pad_token_id)
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.sinusoidal_pos_embds = sinusoidal_pos_embds
@@ -125,18 +131,7 @@ class DistilBertConfig(ModelConfigAdaptersMixin, PretrainedConfig):
         self.initializer_range = initializer_range
         self.qa_dropout = qa_dropout
         self.seq_classif_dropout = seq_classif_dropout
-
-    @property
-    def hidden_size(self):
-        return self.dim
-
-    @property
-    def num_attention_heads(self):
-        return self.n_heads
-
-    @property
-    def num_hidden_layers(self):
-        return self.n_layers
+        super().__init__(**kwargs, pad_token_id=pad_token_id)
 
     @property
     def hidden_dropout_prob(self):
@@ -145,3 +140,18 @@ class DistilBertConfig(ModelConfigAdaptersMixin, PretrainedConfig):
     @property
     def attention_probs_dropout_prob(self):
         return self.attention_dropout
+
+
+class DistilBertOnnxConfig(OnnxConfig):
+    @property
+    def inputs(self) -> Mapping[str, Mapping[int, str]]:
+        return OrderedDict(
+            [
+                ("input_ids", {0: "batch", 1: "sequence"}),
+                ("attention_mask", {0: "batch", 1: "sequence"}),
+            ]
+        )
+
+    @property
+    def outputs(self) -> Mapping[str, Mapping[int, str]]:
+        return OrderedDict([("last_hidden_state", {0: "batch", 1: "sequence"})])

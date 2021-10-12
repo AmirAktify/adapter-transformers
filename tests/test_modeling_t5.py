@@ -30,7 +30,15 @@ from .test_modeling_common import ModelTesterMixin, ids_tensor
 if is_torch_available():
     import torch
 
-    from transformers import ByT5Tokenizer, T5Config, T5EncoderModel, T5ForConditionalGeneration, T5Model, T5Tokenizer
+    from transformers import (
+        ByT5Tokenizer,
+        T5Config,
+        T5EncoderModel,
+        T5ForConditionalGeneration,
+        T5Model,
+        T5ModelWithHeads,
+        T5Tokenizer,
+    )
     from transformers.models.t5.modeling_t5 import T5_PRETRAINED_MODEL_ARCHIVE_LIST
 
 
@@ -100,8 +108,20 @@ class T5ModelTester:
         if self.use_labels:
             lm_labels = ids_tensor([self.batch_size, self.decoder_seq_length], self.vocab_size)
 
-        config = T5Config(
-            vocab_size=self.vocab_size,
+        config = self.get_config()
+
+        return (
+            config,
+            input_ids,
+            decoder_input_ids,
+            attention_mask,
+            decoder_attention_mask,
+            lm_labels,
+        )
+
+    def get_pipeline_config(self):
+        return T5Config(
+            vocab_size=166,  # t5 forces 100 extra tokens
             d_model=self.hidden_size,
             d_ff=self.d_ff,
             d_kv=self.hidden_size // self.num_attention_heads,
@@ -117,13 +137,22 @@ class T5ModelTester:
             decoder_start_token_id=self.decoder_start_token_id,
         )
 
-        return (
-            config,
-            input_ids,
-            decoder_input_ids,
-            attention_mask,
-            decoder_attention_mask,
-            lm_labels,
+    def get_config(self):
+        return T5Config(
+            vocab_size=self.vocab_size,
+            d_model=self.hidden_size,
+            d_ff=self.d_ff,
+            d_kv=self.hidden_size // self.num_attention_heads,
+            num_layers=self.num_hidden_layers,
+            num_decoder_layers=self.decoder_layers,
+            num_heads=self.num_attention_heads,
+            relative_attention_num_buckets=self.relative_attention_num_buckets,
+            dropout_rate=self.dropout_rate,
+            initializer_factor=self.initializer_factor,
+            eos_token_id=self.eos_token_id,
+            bos_token_id=self.pad_token_id,
+            pad_token_id=self.pad_token_id,
+            decoder_start_token_id=self.decoder_start_token_id,
         )
 
     def check_prepare_lm_labels_via_shift_left(
@@ -486,7 +515,7 @@ class T5ModelTester:
 @require_torch
 class T5ModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
 
-    all_model_classes = (T5Model, T5ForConditionalGeneration) if is_torch_available() else ()
+    all_model_classes = (T5Model, T5ForConditionalGeneration, T5ModelWithHeads) if is_torch_available() else ()
     all_generative_model_classes = (T5ForConditionalGeneration,) if is_torch_available() else ()
     fx_ready_model_classes = all_model_classes
     all_parallelizable_model_classes = (T5Model, T5ForConditionalGeneration) if is_torch_available() else ()
@@ -802,7 +831,7 @@ class T5ModelIntegrationTests(unittest.TestCase):
         model.config.do_sample = False
         tokenizer = T5Tokenizer.from_pretrained("t5-small")
 
-        input_ids = tokenizer("summarize: Hello there", return_tensors="pt").input_ids
+        input_ids = tokenizer("summarize: Hello there", return_tensors="pt").input_ids.to(torch_device)
 
         sequences = model.generate(input_ids)
 

@@ -289,6 +289,20 @@ STATIC_TO_FLEX_HEAD_MAP = {
         },
         "layers": ["lm_head"],
     },
+    "GPT2ForTokenClassification": {
+        "config": {
+            "head_type": "tagging",
+            "layers": 1,
+            "activation_function": None,
+        },
+        "layers": [None, "classifier"],
+    },
+    "T5ForConditionalGeneration": {
+        "config": {
+            "head_type": "seq2seq_lm",
+        },
+        "layers": ["lm_head"],
+    },
 }
 
 
